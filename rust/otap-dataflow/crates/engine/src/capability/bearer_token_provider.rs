@@ -22,6 +22,7 @@ use super::error::CapabilityError;
 use futures::Stream;
 use otap_df_engine_macros::capability;
 use secrecy::{ExposeSecret, SecretString};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -115,6 +116,13 @@ impl BearerToken {
 /// `shared` (`Send`) trait variants unchanged.
 pub type TokenStream = Pin<Box<dyn Stream<Item = BearerToken> + 'static>>;
 
+/// Future returned by [`BearerTokenProvider::request_refresh`].
+///
+/// A boxed future (rather than an `async fn`) so the method can carry a
+/// default no-op body in the `Send` trait variant without an `async_trait`
+/// `Self: Sync` bound.
+pub type RefreshFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
 /// Hands out OAuth bearer tokens to data-path nodes.
 #[capability(
     name = "bearer_token_provider",
@@ -147,6 +155,15 @@ pub trait BearerTokenProvider {
     /// subscription, and the next successful refresh still yields a token
     /// (see [`TokenStream`]).
     fn token_stream(&self) -> TokenStream;
+
+    /// Requests an out-of-band refresh, e.g. after a consumer saw a 401/403
+    /// with the current token. Best-effort and coalesced by the provider; the
+    /// future resolves once the refresh attempt completes, so a following
+    /// `get_token`/`token_stream` observes any new token. Default: no-op (for
+    /// providers that only refresh on a schedule).
+    fn request_refresh(&self) -> RefreshFuture<'_> {
+        Box::pin(async {})
+    }
 }
 
 #[cfg(test)]
