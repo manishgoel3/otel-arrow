@@ -69,6 +69,12 @@ use otap_df_otap::metrics::ExporterPDataExportMetrics;
 use otap_df_otap::pdata::OtapPdata;
 use otap_df_telemetry::common_attributes::{Outcome, SignalOutcomeAttributes};
 
+mod agent_fed_source;
+
+use agent_fed_source::AgentFedGenevaSource;
+use otap_df_engine::capability::bearer_token_provider::BearerTokenProvider as BearerTokenProviderCap;
+use otap_df_engine::capability::vendor_bundle::VendorBundle as VendorBundleCap;
+
 /// The URN for the Geneva exporter
 pub const GENEVA_EXPORTER_URN: &str = "urn:microsoft:exporter:geneva";
 
@@ -150,6 +156,12 @@ pub enum AuthConfig {
         /// MSI resource identifier
         msi_resource: String,
     },
+    /// Agent-fed credentials: the host agent supplies the
+    /// GIG token and routing attributes through the `bearer_token_provider`
+    /// and `vendor_bundle` capabilities, so the uploader skips the GCS
+    /// config-service handshake. Carries no config fields; the capabilities
+    /// are bound to a host extension via the node's `capabilities` block.
+    AgentFed,
 }
 
 /// Geneva exporter metrics.
@@ -261,6 +273,7 @@ impl GenevaExporter {
     pub fn from_config(
         pipeline_ctx: PipelineContext,
         config: &serde_json::Value,
+        capabilities: &otap_df_engine::capability::registry::Capabilities,
     ) -> Result<Self, otap_df_config::error::Error> {
         let pdata_metrics = ExporterPDataExportMetrics::register(&pipeline_ctx);
         let metrics = pipeline_ctx.register_metrics::<ExporterMetrics>();
@@ -289,6 +302,9 @@ impl GenevaExporter {
             AuthConfig::WorkloadIdentity { msi_resource } => AuthMethod::WorkloadIdentity {
                 resource: msi_resource.clone(),
             },
+            // Unused on the agent-fed path (the token comes from the capability
+            // via `with_agent_fed_source`); only satisfies the shared config struct.
+            AuthConfig::AgentFed => AuthMethod::SystemManagedIdentity,
         };
 
         // Get MSI resource if needed for managed identity
@@ -297,7 +313,7 @@ impl GenevaExporter {
             | AuthConfig::UserManagedIdentity { msi_resource, .. }
             | AuthConfig::UserManagedIdentityByArmResourceId { msi_resource, .. }
             | AuthConfig::WorkloadIdentity { msi_resource } => Some(msi_resource.clone()),
-            AuthConfig::Certificate { .. } => None,
+            AuthConfig::Certificate { .. } | AuthConfig::AgentFed => None,
         };
 
         // Create GenevaClient configuration
@@ -336,12 +352,39 @@ impl GenevaExporter {
             });
         }
 
-        // Initialize Geneva client
-        let geneva_client = GenevaClient::new(client_config).map_err(|e| {
-            otap_df_config::error::Error::InvalidUserConfig {
-                error: format!("Failed to initialize Geneva client: {}", e),
+        // Initialize the Geneva client. Agent-fed auth resolves the agent-fed
+        // bearer + vendor capabilities and feeds them to the uploader; all
+        // other auth methods drive the GCS config-service handshake.
+        let geneva_client = match &config.auth {
+            AuthConfig::AgentFed => {
+                let bearer = capabilities
+                    .require_shared::<BearerTokenProviderCap>()
+                    .map_err(|e| otap_df_config::error::Error::InvalidUserConfig {
+                        error: format!(
+                            "agent-fed auth requires a bound bearer_token_provider capability: {e}"
+                        ),
+                    })?;
+                let vendor = capabilities
+                    .require_shared::<VendorBundleCap>()
+                    .map_err(|e| otap_df_config::error::Error::InvalidUserConfig {
+                        error: format!(
+                            "agent-fed Geneva auth requires a bound vendor_bundle capability \
+                             (carries the endpoint/moniker routing): {e}"
+                        ),
+                    })?;
+                let source = AgentFedGenevaSource::new(bearer, vendor);
+                GenevaClient::with_agent_fed_source(client_config, Arc::new(source)).map_err(
+                    |e| otap_df_config::error::Error::InvalidUserConfig {
+                        error: format!("Failed to initialize agent-fed Geneva client: {e}"),
+                    },
+                )?
             }
-        })?;
+            _ => GenevaClient::new(client_config).map_err(|e| {
+                otap_df_config::error::Error::InvalidUserConfig {
+                    error: format!("Failed to initialize Geneva client: {}", e),
+                }
+            })?,
+        };
 
         Ok(Self {
             config,
@@ -707,9 +750,9 @@ pub static GENEVA_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
              node: NodeId,
              node_config: Arc<NodeUserConfig>,
              exporter_config: &ExporterConfig,
-             _capabilities: &otap_df_engine::capability::registry::Capabilities| {
+             capabilities: &otap_df_engine::capability::registry::Capabilities| {
         Ok(ExporterWrapper::local(
-            GenevaExporter::from_config(pipeline, &node_config.config)?,
+            GenevaExporter::from_config(pipeline, &node_config.config, capabilities)?,
             node,
             node_config,
             exporter_config,
