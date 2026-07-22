@@ -81,10 +81,9 @@ pub const GENEVA_EXPORTER_URN: &str = "urn:microsoft:exporter:geneva";
 
 /// Configuration for the Geneva Exporter
 #[derive(Debug, Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "ConfigBuilder")]
 pub struct Config {
     /// Geneva config-service endpoint URL (required except for agent-fed auth)
-    #[serde(default)]
     pub endpoint: String,
     /// Environment (e.g., "production", "staging")
     pub environment: String,
@@ -93,7 +92,6 @@ pub struct Config {
     /// Geneva namespace
     pub namespace: String,
     /// Azure region (required except for agent-fed auth)
-    #[serde(default)]
     pub region: String,
     /// Config major version (required)
     pub config_major_version: u32,
@@ -107,11 +105,30 @@ pub struct Config {
     pub auth: AuthConfig,
     /// Maximum buffer size before forcing flush (default: 1000)
     /// Note: This field is currently reserved for future use and does not affect runtime behavior.
-    #[serde(default = "default_buffer_size")]
     pub max_buffer_size: usize,
     /// Maximum concurrent uploads (default: 4)
-    #[serde(default = "default_max_concurrent")]
     pub max_concurrent_uploads: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigBuilder {
+    #[serde(default)]
+    endpoint: String,
+    environment: String,
+    account: String,
+    namespace: String,
+    #[serde(default)]
+    region: String,
+    config_major_version: u32,
+    tenant: String,
+    role_name: String,
+    role_instance: String,
+    auth: AuthConfig,
+    #[serde(default = "default_buffer_size")]
+    max_buffer_size: usize,
+    #[serde(default = "default_max_concurrent")]
+    max_concurrent_uploads: usize,
 }
 
 const fn default_buffer_size() -> usize {
@@ -124,34 +141,49 @@ const fn default_max_concurrent() -> usize {
 
 impl Config {
     fn parse(config: &serde_json::Value) -> Result<Self, otap_df_config::error::Error> {
-        let parsed: Self = serde_json::from_value(config.clone()).map_err(|error| {
+        serde_json::from_value(config.clone()).map_err(|error| {
             otap_df_config::error::Error::InvalidUserConfig {
                 error: error.to_string(),
             }
-        })?;
-        parsed.validate()?;
-        Ok(parsed)
+        })
     }
 
-    fn validate(&self) -> Result<(), otap_df_config::error::Error> {
+    fn validate(&self) -> Result<(), String> {
         if self.account.trim().is_empty() {
-            return Err(otap_df_config::error::Error::InvalidUserConfig {
-                error: "account must not be empty".to_owned(),
-            });
+            return Err("account must not be empty".to_owned());
         }
         if !matches!(self.auth, AuthConfig::AgentFed) {
             if self.endpoint.trim().is_empty() {
-                return Err(otap_df_config::error::Error::InvalidUserConfig {
-                    error: "endpoint is required unless auth.type is agentfed".to_owned(),
-                });
+                return Err("endpoint is required unless auth.type is agentfed".to_owned());
             }
             if self.region.trim().is_empty() {
-                return Err(otap_df_config::error::Error::InvalidUserConfig {
-                    error: "region is required unless auth.type is agentfed".to_owned(),
-                });
+                return Err("region is required unless auth.type is agentfed".to_owned());
             }
         }
         Ok(())
+    }
+}
+
+impl TryFrom<ConfigBuilder> for Config {
+    type Error = String;
+
+    fn try_from(builder: ConfigBuilder) -> Result<Self, Self::Error> {
+        let config = Self {
+            endpoint: builder.endpoint,
+            environment: builder.environment,
+            account: builder.account,
+            namespace: builder.namespace,
+            region: builder.region,
+            config_major_version: builder.config_major_version,
+            tenant: builder.tenant,
+            role_name: builder.role_name,
+            role_instance: builder.role_instance,
+            auth: builder.auth,
+            max_buffer_size: builder.max_buffer_size,
+            max_concurrent_uploads: builder.max_concurrent_uploads,
+        };
+        config.validate()?;
+        Ok(config)
     }
 }
 
@@ -309,6 +341,9 @@ pub struct GenevaExporter {
     geneva_client: GenevaClient,
 }
 
+/// Validates the node-level bindings that the config-only factory validation
+/// hook cannot inspect. Called during exporter creation before either
+/// capability is consumed.
 fn validate_agent_fed_capability_bindings(
     node_config: &NodeUserConfig,
 ) -> Result<(), otap_df_config::error::Error> {
@@ -329,7 +364,7 @@ fn validate_agent_fed_capability_bindings(
         return Err(otap_df_config::error::Error::InvalidUserConfig {
             error: format!(
                 "agent-fed Geneva auth requires '{bearer_name}' and '{vendor_name}' \
-                 to bind to the same extension instance"
+                 to bind to the same configured extension"
             ),
         });
     }
@@ -1372,7 +1407,8 @@ mod tests {
 
     #[test]
     fn agent_fed_config_can_omit_gcs_endpoint_and_region() {
-        let config = Config::parse(&agent_fed_test_config()).expect("valid agent-fed config");
+        let config: Config =
+            serde_json::from_value(agent_fed_test_config()).expect("valid agent-fed config");
         assert!(config.endpoint.is_empty());
         assert!(config.region.is_empty());
         assert!(matches!(config.auth, AuthConfig::AgentFed));
@@ -1385,7 +1421,8 @@ mod tests {
             .as_object_mut()
             .expect("object")
             .remove("endpoint");
-        let error = Config::parse(&missing_endpoint).expect_err("endpoint must be required");
+        let error = serde_json::from_value::<Config>(missing_endpoint)
+            .expect_err("endpoint must be required");
         assert!(error.to_string().contains("endpoint is required"));
 
         let mut missing_region = test_config();
@@ -1393,7 +1430,8 @@ mod tests {
             .as_object_mut()
             .expect("object")
             .remove("region");
-        let error = Config::parse(&missing_region).expect_err("region must be required");
+        let error =
+            serde_json::from_value::<Config>(missing_region).expect_err("region must be required");
         assert!(error.to_string().contains("region is required"));
     }
 
@@ -1401,7 +1439,7 @@ mod tests {
     fn agent_fed_config_requires_account_for_moniker_selection() {
         let mut config = agent_fed_test_config();
         config["account"] = serde_json::Value::String(String::new());
-        let error = Config::parse(&config).expect_err("account must be required");
+        let error = serde_json::from_value::<Config>(config).expect_err("account must be required");
         assert!(error.to_string().contains("account must not be empty"));
     }
 
@@ -1410,7 +1448,7 @@ mod tests {
         let node_config = agent_fed_node_config(Some("agent-a"), Some("agent-b"));
         let error = validate_agent_fed_capability_bindings(&node_config)
             .expect_err("mismatched extensions must fail");
-        assert!(error.to_string().contains("same extension instance"));
+        assert!(error.to_string().contains("same configured extension"));
 
         let node_config = agent_fed_node_config(Some("agent"), Some("agent"));
         validate_agent_fed_capability_bindings(&node_config)
@@ -1428,6 +1466,37 @@ mod tests {
         let error = validate_agent_fed_capability_bindings(&missing_vendor)
             .expect_err("vendor binding must be required");
         assert!(error.to_string().contains("vendor_bundle"));
+    }
+
+    #[test]
+    fn agent_fed_factory_fails_closed_on_invalid_bindings() {
+        let exporter_config = ExporterConfig::new("test-exporter");
+
+        let missing_bindings = (GENEVA_EXPORTER.create)(
+            create_test_pipeline_context(),
+            test_node("test-exporter".to_owned()),
+            Arc::new(agent_fed_node_config(None, None)),
+            &exporter_config,
+            &otap_df_engine::capability::registry::Capabilities::empty(),
+        );
+        let error = match missing_bindings {
+            Ok(_) => panic!("missing bindings must fail exporter creation"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("bearer_token_provider"));
+
+        let mismatched_bindings = (GENEVA_EXPORTER.create)(
+            create_test_pipeline_context(),
+            test_node("test-exporter".to_owned()),
+            Arc::new(agent_fed_node_config(Some("agent-a"), Some("agent-b"))),
+            &exporter_config,
+            &otap_df_engine::capability::registry::Capabilities::empty(),
+        );
+        let error = match mismatched_bindings {
+            Ok(_) => panic!("mismatched bindings must fail exporter creation"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("same configured extension"));
     }
 
     #[test]
