@@ -99,10 +99,7 @@ impl AgentFedCredentialSource for AgentFedGenevaSource {
             let token = match self.bearer.lock().await.get_token().await {
                 Ok(token) => {
                     self.bearer_failures.record_success();
-                    // The uploader credential owns a String, so this is the
-                    // required plaintext copy at the adapter boundary. Its
-                    // Debug implementation redacts the token.
-                    token.expose_token().to_owned()
+                    token
                 }
                 Err(error) => {
                     if let Some(consecutive_failures) = self.bearer_failures.record_failure() {
@@ -115,7 +112,7 @@ impl AgentFedCredentialSource for AgentFedGenevaSource {
                     return None;
                 }
             };
-            if token.trim().is_empty() {
+            if token.expose_token().trim().is_empty() {
                 Self::log_invalid_credential(
                     &self.empty_token_failures,
                     "bearer token is empty or whitespace",
@@ -151,11 +148,13 @@ impl AgentFedCredentialSource for AgentFedGenevaSource {
                 }
             };
 
-            Some(AgentFedCredential {
-                token,
-                endpoint: endpoint.to_owned(),
-                moniker: moniker.to_owned(),
-            })
+            // Keep the engine token secret-wrapped across the routing lookup;
+            // the uploader creates its zeroizing owned copy only after success.
+            Some(AgentFedCredential::new(
+                token.expose_token(),
+                endpoint,
+                moniker,
+            ))
         })
     }
 }
@@ -276,7 +275,7 @@ mod tests {
     async fn returns_credential_when_token_and_routing_present() {
         let s = source("tok", false, full_attrs());
         let c = s.current().await.expect("credential");
-        assert_eq!(c.token, "tok");
+        assert_eq!(c.expose_token(), "tok");
         assert_eq!(c.endpoint, "https://ep");
         assert_eq!(c.moniker, "mon");
     }
@@ -521,7 +520,7 @@ mod tests {
         assert!(source.current().await.is_none());
         assert!(source.current().await.is_none());
         let credential = source.current().await.expect("recovered credential");
-        assert_eq!(credential.token, "recovered-token");
+        assert_eq!(credential.expose_token(), "recovered-token");
         assert_eq!(credential.endpoint, "https://ep");
         assert_eq!(credential.moniker, "mon");
     }
@@ -549,8 +548,8 @@ mod tests {
             Box::new(MockVendor(obj(full_attrs()))),
             "account".to_owned(),
         );
-        assert_eq!(source.current().await.unwrap().token, "token-1");
-        assert_eq!(source.current().await.unwrap().token, "token-2");
+        assert_eq!(source.current().await.unwrap().expose_token(), "token-1");
+        assert_eq!(source.current().await.unwrap().expose_token(), "token-2");
     }
 
     /// Scenario: Credential failures continue and later recover.

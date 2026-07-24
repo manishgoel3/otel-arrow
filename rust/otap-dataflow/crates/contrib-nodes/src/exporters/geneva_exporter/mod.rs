@@ -1589,7 +1589,7 @@ mod tests {
         let source = AgentFedGenevaSource::new(bearer, vendor, "test-account".to_owned());
 
         let initial = source.current().await.expect("initial credential");
-        assert_eq!(initial.token, "test-token");
+        assert_eq!(initial.expose_token(), "test-token");
         assert_eq!(initial.endpoint, "https://ep");
         assert_eq!(initial.moniker, "test-moniker");
 
@@ -1607,7 +1607,7 @@ mod tests {
         }
 
         let rotated = source.current().await.expect("rotated credential");
-        assert_eq!(rotated.token, "rotated-token");
+        assert_eq!(rotated.expose_token(), "rotated-token");
         assert_eq!(rotated.endpoint, "https://rotated-ep");
         assert_eq!(rotated.moniker, "rotated-moniker");
     }

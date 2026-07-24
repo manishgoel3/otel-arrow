@@ -16,6 +16,9 @@ subtext: |
   snapshot. Token and bundle reads are non-atomic, so the host and backend must
   make transient mixed-generation pairs safe or reject them. A rejected upload
   is NACKed so the pipeline's retry policy can read the capabilities again.
+  Creation of an owned token copy is deferred until routing succeeds, and the
+  uploader keeps application-owned credential and authorization-header copies
+  in zeroizing storage.
   The Azure Monitor exporter already consumes the `BearerTokenProvider`
   capability, so an agent-fed host extension bound to that capability serves
   it with no exporter change.
